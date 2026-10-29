@@ -1,0 +1,230 @@
+name: Build arm64 APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      create_release:
+        description: 'Create a GitHub Release'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/build_arm64.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build arm64 APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          java-version: 25
+          distribution: temurin
+
+      - name: Set up gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Setup Android SDK Build-Tools
+        run: |
+          ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager "build-tools;35.0.1"
+
+      - name: Prepare build environment
+        run: |
+          mkdir -p app/src/main/assets
+
+          # Setup google-services.json
+          if [ -n "${{ secrets.GOOGLE_SERVICES_TEXT }}" ]; then
+            echo "${{ secrets.GOOGLE_SERVICES_TEXT }}" > app/google-services.json
+          else
+            cat << 'EOF' > app/google-services.json
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "tachiyomi-sy-dummy",
+              "storage_bucket": "tachiyomi-sy-dummy.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "eu.kanade.tachiyomi.sy"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "dummy_api_key"
+                  }
+                ],
+                "services": {
+                  "analytics_service": {
+                    "status": 1
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          fi
+
+          # Setup client_secrets.json
+          if [ -n "${{ secrets.CLIENT_SECRETS_TEXT }}" ]; then
+            echo "${{ secrets.CLIENT_SECRETS_TEXT }}" > app/src/main/assets/client_secrets.json
+          else
+            cat << 'EOF' > app/src/main/assets/client_secrets.json
+          {
+            "installed": {
+              "client_id": "dummy.apps.googleusercontent.com",
+              "project_id": "dummy",
+              "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+              "token_uri": "https://oauth2.googleapis.com/token",
+              "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+              "redirect_uris": ["eu.kanade.google.oauth:/oauth2redirect"]
+            }
+          }
+          EOF
+          fi
+
+      - name: Build APK
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          if [ -z "$BUILD_TYPE" ]; then
+            BUILD_TYPE="release"
+          fi
+
+          echo "Building variant: $BUILD_TYPE"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./gradlew assembleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+
+      - name: Sign and Package arm64 APK
+        run: |
+          set -e
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          if [ -z "$BUILD_TYPE" ]; then
+            BUILD_TYPE="release"
+          fi
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          APKSIGNER=$(find "$SDK_ROOT/build-tools" -name apksigner 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$APKSIGNER" ]; then
+            APKSIGNER="apksigner"
+          fi
+          echo "Using apksigner: $APKSIGNER"
+
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ARM64_IN="app/build/outputs/apk/release/app-arm64-v8a-release-unsigned.apk"
+            UNIVERSAL_IN="app/build/outputs/apk/release/app-universal-release-unsigned.apk"
+
+            if [ -n "${{ secrets.SIGNING_KEY }}" ]; then
+              echo "Using secrets.SIGNING_KEY..."
+              echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signing_key.jks
+              $APKSIGNER sign --ks signing_key.jks \
+                --ks-key-alias "${{ secrets.ALIAS }}" \
+                --ks-pass "pass:${{ secrets.KEY_STORE_PASSWORD }}" \
+                --key-pass "pass:${{ secrets.KEY_PASSWORD }}" \
+                --out TachiyomiSY-arm64-v8a.apk \
+                "$ARM64_IN"
+
+              if [ -f "$UNIVERSAL_IN" ]; then
+                $APKSIGNER sign --ks signing_key.jks \
+                  --ks-key-alias "${{ secrets.ALIAS }}" \
+                  --ks-pass "pass:${{ secrets.KEY_STORE_PASSWORD }}" \
+                  --key-pass "pass:${{ secrets.KEY_PASSWORD }}" \
+                  --out TachiyomiSY-universal.apk \
+                  "$UNIVERSAL_IN"
+              fi
+            else
+              echo "Generating keystore for signing..."
+              keytool -genkeypair -v -keystore release.jks -alias tachiyomi -keyalg RSA -keysize 2048 -validity 10000 \
+                -storepass tachiyomi -keypass tachiyomi \
+                -dname "CN=TachiyomiSY, OU=TachiyomiSY, O=TachiyomiSY, L=Unknown, ST=Unknown, C=US"
+
+              $APKSIGNER sign --ks release.jks \
+                --ks-key-alias tachiyomi \
+                --ks-pass pass:tachiyomi \
+                --key-pass pass:tachiyomi \
+                --out TachiyomiSY-arm64-v8a.apk \
+                "$ARM64_IN"
+
+              if [ -f "$UNIVERSAL_IN" ]; then
+                $APKSIGNER sign --ks release.jks \
+                  --ks-key-alias tachiyomi \
+                  --ks-pass pass:tachiyomi \
+                  --key-pass pass:tachiyomi \
+                  --out TachiyomiSY-universal.apk \
+                  "$UNIVERSAL_IN"
+              fi
+            fi
+          else
+            cp app/build/outputs/apk/debug/app-arm64-v8a-debug.apk TachiyomiSY-arm64-v8a.apk
+            if [ -f app/build/outputs/apk/debug/app-universal-debug.apk ]; then
+              cp app/build/outputs/apk/debug/app-universal-debug.apk TachiyomiSY-universal.apk
+            fi
+          fi
+
+          echo "Verifying arm64 APK signature..."
+          $APKSIGNER verify TachiyomiSY-arm64-v8a.apk
+          ls -lh TachiyomiSY-*.apk
+
+      - name: Upload arm64 APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: TachiyomiSY-arm64-v8a
+          path: TachiyomiSY-arm64-v8a.apk
+          if-no-files-found: error
+
+      - name: Upload Universal APK
+        if: hashFiles('TachiyomiSY-universal.apk') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: TachiyomiSY-universal
+          path: TachiyomiSY-universal.apk
+          if-no-files-found: warn
+
+      - name: Create GitHub Release
+        if: github.event.inputs.create_release == 'true' || github.event_name == 'push'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: "v${{ github.run_number }}"
+          name: "TachiyomiSY arm64 Build #${{ github.run_number }}"
+          body: |
+            ### TachiyomiSY arm64 Build
+            - Commit: `${{ github.sha }}`
+            - Build Type: `${{ github.event.inputs.build_type || 'release' }}`
+            - Target ABI: `arm64-v8a`
+          files: |
+            TachiyomiSY-*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
