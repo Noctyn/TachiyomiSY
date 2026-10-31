@@ -46,7 +46,7 @@ class SyncYomiSyncService(
     private class SyncYomiException(message: String?) : Exception(message)
 
     private companion object {
-        val TIMEOUT = 30.seconds
+        val TIMEOUT = 180.seconds
         val FULL_SYNC_INTERVAL = 24.hours
     }
 
@@ -252,7 +252,7 @@ class SyncYomiSyncService(
             headers = headers,
         )
 
-        val client = OkHttpClient()
+        val client = syncClient()
         val response = client.newCall(downloadRequest).await()
 
         if (response.code == HttpStatus.SC_NOT_MODIFIED) {
